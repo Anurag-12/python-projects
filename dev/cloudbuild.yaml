@@ -1,0 +1,62 @@
+steps:
+  - name: gcr.io/cloud-builders/gcloud
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        echo "***********************"
+        echo "$BRANCH_NAME"
+        echo "***********************"
+    id: "branch-name"
+
+  - name: gcr.io/cloud-builders/gcloud
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        # File that contains failures.
+        failure_file=failure.log
+        touch ${failure_file}
+        build() {
+          # Loop through the builders, and build independently.
+          for d in $1-*/; do
+            if [ -d ${d} ]; then
+              config="${d}cloudbuild.yaml"
+              if [[ ! -f "${config}" ]]; then
+                echo "${d} failed: ${config} not found." | tee -a ${failure_file}
+                continue
+              fi
+              echo "Building $d ... "
+              (
+                logfile="${d::-1}.log"
+                echo ${logfile}
+                gcloud builds submit ../../../ --config=${config} --substitutions=_TYPE=${_TYPE}> ${logfile} 2>&1
+                if [[ $? -ne 0 ]]; then
+                  echo "$d failed" | tee -a ${failure_file}
+                  cat ${logfile}
+                fi
+              ) &
+            fi
+          done
+        }
+        build provider
+        wait
+        build consumer
+        wait
+        # Check if there is any failure.
+        if [[ -s ${failure_file} ]]; then
+          echo
+          echo "Some builds failed:"
+          cat ${failure_file}
+          echo "Exiting."
+          exit 1
+        fi
+        echo "All builds succeeded."
+    dir: "data-pipelines/$_PIPELINE_NAME/$_ENVIRONMENT"
+    id: "build-pipelines"
+tags: ["$_PIPELINE_NAME", "main", "$_TYPE"]
+
+substitutions:
+  _PIPELINE_NAME: int_s2p_007
+  _ENVIRONMENT: dev
+  _TYPE: "deploy"

@@ -1,0 +1,154 @@
+steps:
+  - id: "set-terraform-bucket-name"
+    name: gcr.io/cloud-builders/gcloud
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        sed -i s/PIPELINE_NAME/$_PIPELINE_NAME/g backend.tf
+        sed -i s/DIR/$_FOLDER/g backend.tf
+        sed -i s/ENVIRONMENT/$_ENVIRONMENT/g backend.tf
+        gcloud secrets versions access latest --secret=artifactory-systemaccount-password > artifactory-password.txt
+    dir: "data-pipelines/$_PIPELINE_NAME/$_ENVIRONMENT/$_FOLDER"
+
+  - id: "create-terraform-state-bucket"
+    name: gcr.io/cloud-builders/gcloud
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        gsutil mb -p $_PROJECT_ID -l $_TFBUCKET_REGION gs://$_PIPELINE_NAME-$_FOLDER-$_ENVIRONMENT-tfstate || true
+        gsutil versioning set on gs://$_PIPELINE_NAME-$_FOLDER-$_ENVIRONMENT-tfstate
+  - id: "access-ssh-key-from-secret-manager"
+    name: gcr.io/cloud-builders/gcloud
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        gcloud secrets versions access latest --secret=github-key > /root/.ssh/id_github
+    volumes:
+      - name: "ssh"
+        path: /root/.ssh
+
+  - id: "setup-git-with-key-and-domain"
+    name: "gcr.io/cloud-builders/git"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        chmod 600 /root/.ssh/id_github
+        cat <<EOF >/root/.ssh/config
+        Hostname github.com
+        IdentityFile /root/.ssh/id_github
+        EOF
+        ssh-keyscan -t rsa github.com > /root/.ssh/known_hosts
+    volumes:
+      - name: "ssh"
+        path: /root/.ssh
+
+  - id: "terraform-init"
+    name: "${_TERRAFORM_IMAGE}"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        artifactoryPassword=$(<artifactory-password.txt)
+        export TF_VAR_artifactory_password=$artifactoryPassword
+        terraform init 
+    env:
+      - "TF_VAR_project_id=$_PROJECT_ID"
+      - "TF_VAR_ref=$_PIPELINE_REF"
+    dir: "data-pipelines/$_PIPELINE_NAME/$_ENVIRONMENT/$_FOLDER"
+    volumes:
+      - name: "ssh"
+        path: /root/.ssh
+
+  - id: "terraform-plan"
+    name: "${_TERRAFORM_IMAGE}"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        artifactoryPassword=$(<artifactory-password.txt)
+        export TF_VAR_artifactory_password=$artifactoryPassword
+        terraform plan
+    env:
+      - "TF_VAR_project_id=$_PROJECT_ID"
+      - "TF_VAR_ref=$_PIPELINE_REF"
+    dir: "data-pipelines/$_PIPELINE_NAME/$_ENVIRONMENT/$_FOLDER"
+
+  - id: "terraform-deploy-or-destroy"
+    name: "${_TERRAFORM_IMAGE}"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        artifactoryPassword=$(<artifactory-password.txt)
+        export TF_VAR_artifactory_password=$artifactoryPassword
+        if [ ${_TYPE} == "deploy" ]
+        then 
+          terraform apply -auto-approve
+        elif [ ${_TYPE} == "destroy" ]
+        then
+          terraform destroy -auto-approve
+        elif [ ${_TYPE} == "destroy-df" ]
+        then
+          terraform destroy -auto-approve -target=module.pubsub_endpoint_pattern.module.pubsub_endpoint_dataflow.google_dataflow_job.gdf
+        else 
+          echo "${_TYPE}, jumping over step"
+        fi
+    env:
+      - "TF_VAR_project_id=$_PROJECT_ID"
+      - "TF_VAR_ref=$_PIPELINE_REF"
+    dir: "data-pipelines/$_PIPELINE_NAME/$_ENVIRONMENT/$_FOLDER"
+
+  - id: "Get terraform file"
+    name: gcr.io/cloud-builders/gcloud
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        if [ ${_TYPE} == "deploy" ] ||  [ ${_TYPE} == "destroy" ] ||  [ ${_TYPE} == "destroy-df" ]
+        then 
+        gsutil cp gs://$_PIPELINE_NAME-$_FOLDER-$_ENVIRONMENT-tfstate/state/default.tfstate .
+        else 
+          echo "${_TYPE}, jumping over step"
+        fi
+    dir: "data-pipelines/$_PIPELINE_NAME/$_ENVIRONMENT/$_FOLDER"
+  
+  - id: "update_deployment_table"
+    name: python:3.7
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        if [ ${_TYPE} == "deploy1" ] ||  [ ${_TYPE} == "destroy" ] ||  [ ${_TYPE} == "destroy-df" ]
+        then 
+        pip install google.cloud.datastore
+          python  datastore-deployment-update.py "${_PIPELINE_NAME}" "${_TYPE}" "${_FOLDER}" "${_ENVIRONMENT}"
+        else 
+          echo "${_TYPE}, jumping over step"
+        fi 
+        if [ ${_ENVIRONMENT} == "dev1" ] && [ ${_TYPE} == "deploy1" ]
+        then
+          pip install google.cloud.storage
+          pip install --upgrade google-cloud-pubsub
+          python  endpoint-test-script.py "${_PIPELINE_NAME}" "${_ENVIRONMENT}" "${_PROJECT_ID}"
+        fi
+    dir: "data-pipelines/scripts"
+
+tags: ["$_PIPELINE_NAME", "$_FOLDER", "${_TYPE}"]
+
+options:
+    dynamic_substitutions: true
+
+substitutions:
+  _PROJECT_ID: "ingka-dp-sap-dev"
+  #_PROVIDER_PROJECT_ID: "ingka-dp-calc-${_ENVIRONMENT}"
+  _TFBUCKET_REGION: "europe-west3"
+  _ENVIRONMENT: "dev"
+  _FOLDER: "consumer-sap"
+  _PIPELINE_NAME: "int_s2p_002_resub1"
+  _PIPELINE_REF: "store-goods-resub1"
+  _TERRAFORM_IMAGE: "gcr.io/ingka-dpfwcbt-deploy-${_ENVIRONMENT}/mvnterraform:0.14.3"
+  _TYPE: "deploy"
